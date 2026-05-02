@@ -10,7 +10,7 @@ question = "Mike Barnett negotiated many contracts including which player that w
 model_id = "PeterJinGo/SearchR1-nq_hotpotqa_train-qwen2.5-7b-em-ppo"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-question = question.strip()
+question = question.strip()  # 去掉首位的空白字符
 if question[-1] != '?':
     question += '?'
 curr_eos = [151645, 151643] # for Qwen2.5 series models
@@ -64,7 +64,7 @@ def search(query: str):
             "topk": 3,
             "return_scores": True
         }
-    results = requests.post("http://127.0.0.1:8000/retrieve", json=payload).json()['result']
+    results = requests.post("http://127.0.0.1:8000/retrieve", json=payload).json()['result']   # 返回检索结果
                 
     def _passages2string(retrieval_result):
         format_reference = ''
@@ -92,7 +92,7 @@ print('\n\n################# [Start Reasoning + Searching] ##################\n\
 print(prompt)
 # Encode the chat-formatted prompt and move it to the correct device
 while True:
-    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)  # 'pt' means PyTorch Tensor
     attention_mask = torch.ones_like(input_ids)
     
     # Generate text with the stopping criteria

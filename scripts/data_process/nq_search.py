@@ -18,12 +18,41 @@ Preprocess the nq dataset to parquet format
 import re
 import os
 import datasets
+"""
+  hdfs 是 Hadoop Distributed File System 的缩写。
 
+  它是 Hadoop 生态里的分布式文件系统，用来把大规模数据存储在多台机器上。训练大模型时，如果是多机集群，常会把数据集、checkpoint 等放在 HDFS 上，
+  方便不同节点访问。
+"""
 from verl.utils.hdfs_io import copy, makedirs
 import argparse
+"""
+生成的每条样本大概长这样：
 
+  {
+      "data_source": "nq",
+      "prompt": [
+          {
+              "role": "user",
+              "content": "Answer the given question..."
+          }
+      ],
+      "ability": "fact-reasoning",
+      "reward_model": {
+          "style": "rule",
+          "ground_truth": {
+              "target": [...]
+          }
+      },
+      "extra_info": {
+          "split": "train",
+          "index": 0
+      }
+  }
+"""
 
 def make_prefix(dp, template_type):
+    # dp 是一条数据样本，先取出问题
     question = dp['question']
 
     # NOTE: also need to change reward_score/countdown.py
@@ -46,7 +75,7 @@ if __name__ == '__main__':
     parser.add_argument('--template_type', type=str, default='base')
 
     args = parser.parse_args()
-
+    # Natural Questions
     data_source = 'nq'
 
     dataset = datasets.load_dataset('RUC-NLPIR/FlashRAG_datasets', 'nq')
@@ -91,7 +120,8 @@ if __name__ == '__main__':
 
     local_dir = args.local_dir
     hdfs_dir = args.hdfs_dir
-
+    
+    #   parquet 是一种列式存储格式，训练时读起来比较快，也适合大数据集。
     train_dataset.to_parquet(os.path.join(local_dir, 'train.parquet'))
     test_dataset.to_parquet(os.path.join(local_dir, 'test.parquet'))
 
