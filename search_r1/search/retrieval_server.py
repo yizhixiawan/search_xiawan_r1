@@ -41,7 +41,7 @@ def load_model(model_path: str, use_fp16: bool = False):
     model.eval()
     model.cuda()
     if use_fp16: 
-        model = model.half()
+        model = model.half() # 调用半精度方法
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
     return model, tokenizer
 
@@ -51,19 +51,19 @@ def pooling(
     attention_mask = None,
     pooling_method = "mean"
 ):
-    if pooling_method == "mean":
+    if pooling_method == "mean": # mean_pooling 取所有有效token的平均
         last_hidden = last_hidden_state.masked_fill(~attention_mask[..., None].bool(), 0.0)
         return last_hidden.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
-    elif pooling_method == "cls":
+    elif pooling_method == "cls": # cls pooling：取第一个 token 的向量
         return last_hidden_state[:, 0]
-    elif pooling_method == "pooler":
+    elif pooling_method == "pooler": # pooler pooling：直接用模型给出的 pooler_output
         return pooler_output
     else:
         raise NotImplementedError("Pooling method not implemented!")
-
+# 检索模型 Encoder
 class Encoder:
     def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
-        self.model_name = model_name
+        self.model_name = model_name # 检索模型名字
         self.model_path = model_path
         self.pooling_method = pooling_method
         self.max_length = max_length
@@ -75,14 +75,14 @@ class Encoder:
     @torch.no_grad()
     def encode(self, query_list: List[str], is_query=True) -> np.ndarray:
         # processing query for different encoders
-        if isinstance(query_list, str):
-            query_list = [query_list]
+        if isinstance(query_list, str): # 如果传进来的是单个字符串，就包装成列表
+            query_list = [query_list] # lower() 是字符串方法，把字符串转小写
 
         if "e5" in self.model_name.lower():
             if is_query:
-                query_list = [f"query: {query}" for query in query_list]
+                query_list = [f"query: {query}" for query in query_list] # e5 模型要求输入前面带任务前缀
             else:
-                query_list = [f"passage: {query}" for query in query_list]
+                query_list = [f"passage: {query}" for query in query_list] # e5 模型要求输入前面带任务前缀
 
         if "bge" in self.model_name.lower():
             if is_query:
@@ -98,20 +98,21 @@ class Encoder:
 
         if "T5" in type(self.model).__name__:
             # T5-based retrieval model
-            decoder_input_ids = torch.zeros(
+            decoder_input_ids = torch.zeros(  # [batch_size, 1]
                 (inputs['input_ids'].shape[0], 1), dtype=torch.long
             ).to(inputs['input_ids'].device)
             output = self.model(
                 **inputs, decoder_input_ids=decoder_input_ids, return_dict=True
             )
-            query_emb = output.last_hidden_state[:, 0, :]
+            query_emb = output.last_hidden_state[:, 0, :] # 取第一个 token 的 hidden state 作为 query embedding。 [batch_size, hidden_size]
         else:
             output = self.model(**inputs, return_dict=True)
             query_emb = pooling(output.pooler_output,
                                 output.last_hidden_state,
                                 inputs['attention_mask'],
                                 self.pooling_method)
-            if "dpr" not in self.model_name.lower():
+            # 很多稠密检索模型用内积搜索，但如果向量都归一化，内积就等价于 cosine similarity。这样更适合语义相似度检索。
+            if "dpr" not in self.model_name.lower(): # L2 归一化
                 query_emb = torch.nn.functional.normalize(query_emb, dim=-1)
 
         query_emb = query_emb.detach().cpu().numpy()
@@ -131,21 +132,26 @@ class BaseRetriever:
         self.index_path = config.index_path
         self.corpus_path = config.corpus_path
 
-    def _search(self, query: str, num: int, return_score: bool):
+    def _search(self, query: str, num: int, return_score: bool): # 父类只规定接口，具体实现交给子类
         raise NotImplementedError
 
-    def _batch_search(self, query_list: List[str], num: int, return_score: bool):
+    def _batch_search(self, query_list: List[str], num: int, return_score: bool): # 父类只规定接口，具体实现交给子类
         raise NotImplementedError
 
     def search(self, query: str, num: int = None, return_score: bool = False):
         return self._search(query, num, return_score)
     
     def batch_search(self, query_list: List[str], num: int = None, return_score: bool = False):
-        return self._batch_search(query_list, num, return_score)
+        return self._batch_search(query_list, num, return_score) 
 
 class BM25Retriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
+        """
+        pyserini 是一个信息检索工具库，底层用 Java Lucene 做搜索。
+
+        LuceneSearcher 可以读取已经建好的 Lucene/BM25 索引，并执行关键词搜索。
+        """
         from pyserini.search.lucene import LuceneSearcher
         self.searcher = LuceneSearcher(self.index_path)
         self.contain_doc = self._check_contain_doc()
@@ -160,7 +166,9 @@ class BM25Retriever(BaseRetriever):
         if num is None:
             num = self.topk
         hits = self.searcher.search(query, num)
+        # 如果没有检索结果
         if len(hits) < 1:
+            # 如果需要返回分数，就返回两个空列表
             if return_score:
                 return [], []
             else:
@@ -170,9 +178,10 @@ class BM25Retriever(BaseRetriever):
             warnings.warn('Not enough documents retrieved!')
         else:
             hits = hits[:num]
-
+        # 如果 Lucene 索引里包含完整文档内容
         if self.contain_doc:
             all_contents = [
+                # self.searcher.doc(hit.docid) 根据搜索结果的 docid 取文档 .raw() 取原始 JSON 字符串
                 json.loads(self.searcher.doc(hit.docid).raw())['contents'] 
                 for hit in hits
             ]
@@ -207,14 +216,20 @@ class BM25Retriever(BaseRetriever):
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
-        self.index = faiss.read_index(self.index_path)
+        self.index = faiss.read_index(self.index_path) # 从磁盘加载已经构建好的索引文件，例如 e5_Flat.index
         if config.faiss_gpu:
             co = faiss.GpuMultipleClonerOptions()
             co.useFloat16 = True
-            co.shard = True
-            self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+            co.shard = True  # 表示把索引切分到多个 GPU 上，而不是每张 GPU 都复制一份完整索引
+            self.index = faiss.index_cpu_to_all_gpus(self.index, co=co) # 把 CPU 上加载的 FAISS index 转移到所有 GPU 上
 
         self.corpus = load_corpus(self.corpus_path)
+        """
+        注意：FAISS index 只存向量和向量编号，不存完整文本。因为我们本身就是用一个词来做检索，
+        所以只要这个词检索完再返回完整的context即可
+        检索时 FAISS 返回的是文档下标 idxs，还需要用这些下标去 corpus 里取文档内容。
+        
+        """
         self.encoder = Encoder(
             model_name = self.retrieval_method,
             model_path = config.retrieval_model_path,

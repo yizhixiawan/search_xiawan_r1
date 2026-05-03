@@ -35,17 +35,26 @@ class RewardManager():
 
     def __init__(self, tokenizer, num_examine, format_score=0.) -> None:
         self.tokenizer = tokenizer
-        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
-        self.format_score = format_score
+        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console(调试)
+        self.format_score = format_score  # 如果答案格式正确但答案不对，可以给的格式分。默认是 0.0。
 
-    def __call__(self, data: DataProto):
+    def __call__(self, data: DataProto): # data 是一个batch
         """We will expand this function gradually based on the available datasets"""
-
+        """
+        DataProto 里主要有三部分：
+        data.batch
+        data.non_tensor_batch
+        data.meta_info
+        其中：
+        data.batch：tensor 数据，比如 prompts、responses、attention_mask。
+        data.non_tensor_batch：非 tensor 数据，比如 data_source、reward_model。
+        data.meta_info：一些元信息。
+        """
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if 'rm_scores' in data.batch.keys():
             return data.batch['rm_scores']
-
-        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        # RL 训练里 reward 是 token-level 的。这里虽然只有最终答案得分，但它会把分数放到最后一个有效 response token 上。
+        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32) # [batch_size, response_length]
 
         # all_scores = []
 
@@ -53,13 +62,12 @@ class RewardManager():
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
-
             prompt_ids = data_item.batch['prompts']
 
             prompt_length = prompt_ids.shape[-1]
-
+            # 计算 prompt 里真实 token 的数量。
             valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+            valid_prompt_ids = prompt_ids[-valid_prompt_length:] # prompt 是左 padding 的
 
             response_ids = data_item.batch['responses']
             valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
@@ -68,16 +76,16 @@ class RewardManager():
             # decode
             sequences = torch.cat((valid_prompt_ids, valid_response_ids))
             sequences_str = self.tokenizer.decode(sequences)
-
+            # 取标准答案
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
 
-            # select rm_score
+            # select rm_score 取数据源，比如："nq"
             data_source = data_item.non_tensor_batch['data_source']
             compute_score_fn = _select_rm_score_fn(data_source)
 
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
 
-            reward_tensor[i, valid_response_length - 1] = score
+            reward_tensor[i, valid_response_length - 1] = score # ???
             # all_scores.append(score)
 
             if data_source not in already_print_data_sources:
