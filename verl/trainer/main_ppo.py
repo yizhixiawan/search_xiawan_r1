@@ -113,21 +113,22 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
+        # NCCL 是 NVIDIA 的多 GPU 通信库，常用于分布式训练。这个设置可以减少日志噪音，只输出警告及以上级别的信息。
         ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
-
+    # 把 config 传给 Ray 远程任务 main_task，等待它运行结束。
     ray.get(main_task.remote(config))
 
 
 @ray.remote
 def main_task(config):
-    from verl.utils.fs import copy_local_path_from_hdfs
+    from verl.utils.fs import copy_local_path_from_hdfs # Hadoop Distributed File System 分布式文件系统
     from transformers import AutoTokenizer
 
     # print initial config
     from pprint import pprint
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
-    OmegaConf.resolve(config)
+    OmegaConf.resolve(config) #原地解析 config 里的插值引用。执行后，后续访问配置字段时，${...} 这类引用已经被解析。
 
     # env_class = ENV_CLASS_MAPPING[config.env.name]
 
@@ -139,9 +140,11 @@ def main_task(config):
     tokenizer = hf_tokenizer(local_path)
 
     # define worker classes
-    if config.actor_rollout_ref.actor.strategy == 'fsdp':
+    if config.actor_rollout_ref.actor.strategy == 'fsdp': # 读取配置里的 actor 训练策略，Fully Sharded Data Parallel，用于分布式大模型训练
         assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
-        from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+        # ActorRolloutRefWorker：用于 actor、rollout、reference policy。
+        # CriticWorker：用于 critic/value model。
+        from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker # 导入 FSDP 版本的 worker 类
         from verl.single_controller.ray import RayWorkerGroup
         ray_worker_group_cls = RayWorkerGroup
 
@@ -150,12 +153,16 @@ def main_task(config):
         from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
         from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
         ray_worker_group_cls = NVMegatronRayWorkerGroup
-
+    # 说明当前入口只支持这两种策略
     else:
         raise NotImplementedError
 
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
-
+    """
+      Role：枚举训练系统里的角色，比如 ActorRollout、Critic、RefPolicy、RewardModel。
+      ResourcePoolManager：管理 Ray/GPU 资源池，决定每个角色使用哪一组 GPU。
+    """
+    # 建立“训练角色 -> Ray worker 类”的映射
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
