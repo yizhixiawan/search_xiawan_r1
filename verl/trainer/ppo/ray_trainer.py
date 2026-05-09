@@ -41,10 +41,10 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 
 import re
 from search_r1.llm_agent.generation import LLMGenerationManager, GenerationConfig
-
+# 不是 Worker 实例，而是一个 Worker 类本身
 WorkerType = Type[Worker]
 
-
+# 枚举类
 class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
@@ -58,24 +58,25 @@ class Role(Enum):
     ActorRolloutRef = 6
 
 
-@dataclass
-class ResourcePoolManager:
+@dataclass # @dataclass 后，只要写字段，Python 会自动帮你生成构造函数
+class ResourcePoolManager: # 资源池管理器类
     """
     Define a resource pool specification. Resource pool will be initialized first.
     Mapping
     """
-    resource_pool_spec: dict[str, list[int]]
-    mapping: dict[Role, str]
-    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    resource_pool_spec: dict[str, list[int]] # 资源池规格：资源池名字，每个节点上启动多少个进程/GPU worker
+    mapping: dict[Role, str] # 角色到资源池名字的映射
+    # 实际创建出来的资源池对象缓存 资源池名字 -> RayResourcePool 对象
+    resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict) # 证每次创建 ResourcePoolManager 时都生成一个新的空字典。
 
     def create_resource_pool(self):
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
             # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
             # For FSDP backend, we recommend using max_colocate_count=1 that merge all WorkerGroups into one.
             # For Megatron backend, we recommend using max_colocate_count>1 that can utilize different WorkerGroup for differnt models
-            resource_pool = RayResourcePool(process_on_nodes=process_on_nodes,
+            resource_pool = RayResourcePool(process_on_nodes=process_on_nodes, # 指定每个节点上要放多少个 worker/process
                                             use_gpu=True,
-                                            max_colocate_count=1,
+                                            max_colocate_count=1, # 同一份资源池里，最多允许多少组 WorkerGroup / 角色进程共用同一组 GPU 资源
                                             name_prefix=resource_pool_name)
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -91,13 +92,13 @@ from verl.utils.torch_functional import masked_mean
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
     responses = data.batch['responses']
     response_length = responses.size(1)
-    token_level_scores = data.batch['token_level_scores']
+    token_level_scores = data.batch['token_level_scores'] # 最终答案的 EM reward 通常只放在最后一个有效 response token 上，其它 token 是 0
     batch_size = data.batch.batch_size[0]
     attention_mask = data.batch['info_mask'] if 'info_mask' in data.batch else data.batch['attention_mask']
     response_mask = attention_mask[:, -response_length:]
 
     # compute kl between ref_policy and current policy
-    if 'ref_log_prob' in data.batch.keys():
+    if 'ref_log_prob' in data.batch.keys():# 计算kl散度，逐token
         kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
                                     kl_penalty=kl_penalty)  # (batch_size, response_length)
         kld = kld * response_mask
@@ -107,12 +108,12 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         kld = torch.zeros_like(response_mask, dtype=torch.float32)
 
     token_level_rewards = token_level_scores - beta * kld
-
+    # 计算每条样本 response token 上的平均 KL
     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
 
     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
-    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size) # 根据当前 KL 调整 kl_ctrl.value
     data.batch['token_level_rewards'] = token_level_rewards
 
     metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
@@ -159,7 +160,7 @@ def reduce_metrics(metrics: dict):
         metrics[key] = np.mean(val)
     return metrics
 
-
+# 训练过程中，同一个指标可能从多个 worker、多个 micro batch、多个 step 片段收集到多个值。
 def _compute_response_info(batch):
     response_length = batch.batch['responses'].shape[-1]
 
@@ -167,7 +168,7 @@ def _compute_response_info(batch):
     response_mask = batch.batch['attention_mask'][:, -response_length:]
 
     prompt_length = prompt_mask.sum(-1).float()
-    response_length = response_mask.sum(-1).float()  # (batch_size,)
+    response_length = response_mask.sum(-1).float()  # (batch_size,) 有效长度
 
     return dict(
         response_mask=response_mask,
@@ -176,8 +177,12 @@ def _compute_response_info(batch):
     )
 
 
-def compute_data_metrics(batch, use_critic=True):
+def compute_data_metrics(batch, use_critic=True): # 日志统计函数
     # TODO: add response length
+    """
+    从当前训练 batch 里统计 reward、advantage、return、value、prompt 长度、response 长度，以及 Search-R1 多轮搜索相关
+    指标，最后返回一个 metrics 字典用于日志记录
+    """
     sequence_score = batch.batch['token_level_scores'].sum(-1)
     sequence_reward = batch.batch['token_level_rewards'].sum(-1)
 
@@ -201,6 +206,7 @@ def compute_data_metrics(batch, use_critic=True):
     if use_critic:
         values = batch.batch['values']
         valid_values = torch.masked_select(values, response_mask)
+        # 评估 critic / value model 预测得好不好,是一个监控指标，不参与loss
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
@@ -285,7 +291,7 @@ def compute_timing_metrics(batch, timing_raw):
     num_response_tokens = torch.sum(response_info['response_length']).item()
     num_overall_tokens = num_prompt_tokens + num_response_tokens
 
-    num_tokens_of_section = {
+    num_tokens_of_section = { # 说明每个阶段应该除以多少 token 来算 per-token time
         'gen': num_response_tokens,
         **{
             name: num_overall_tokens for name in ['ref', 'values', 'adv', 'update_critic', 'update_actor', 'rollout']
@@ -293,20 +299,20 @@ def compute_timing_metrics(batch, timing_raw):
     }
 
     return {
-        **{
+        **{ # 原始秒级耗时
             f'timing_s/{name}': value for name, value in timing_raw.items()
         },
-        **{
+        **{ # 每 token 耗时 ms = 阶段总耗时秒 * 1000 / 对应 token 数
             f'timing_per_token_ms/{name}': timing_raw[name] * 1000 / num_tokens_of_section[name] for name in set(num_tokens_of_section.keys(
             )) & set(timing_raw.keys())
         },
     }
 
-
+# 装饰器，把一个带 yield 的函数变成可以用于 with 语句的上下文管理器，with 会自动处理进入和退出逻辑
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
     with Timer(name=name, logger=None) as timer:
-        yield
+        yield # 之前的代码会在进入 with 时执行，之后的代码会在退出 with 时执行
     timing_raw[name] = timer.last
 
 
@@ -336,7 +342,7 @@ class RayPPOTrainer(object):
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
 
-        if self.hybrid_engine:
+        if self.hybrid_engine: # Ray workers 里面，同时挂着 actor、rollout、reference 相关能力
             assert Role.ActorRollout in role_worker_mapping, f'{role_worker_mapping.keys()=}'
 
         self.role_worker_mapping = role_worker_mapping
@@ -347,8 +353,10 @@ class RayPPOTrainer(object):
 
         # define KL control
         if self.use_reference_policy:
+            # 创建固定 KL 控制器
             if config.algorithm.kl_ctrl.type == 'fixed':
                 self.kl_ctrl = core_algos.FixedKLController(kl_coef=config.algorithm.kl_ctrl.kl_coef)
+            # 自适应 KL 控制器
             elif config.algorithm.kl_ctrl.type == 'adaptive':
                 assert config.algorithm.kl_ctrl.horizon > 0, f'horizon must be larger than 0. Got {config.critic.kl_ctrl.horizon}'
                 self.kl_ctrl = core_algos.AdaptiveKLController(init_kl_coef=config.algorithm.kl_ctrl.kl_coef,
@@ -358,14 +366,15 @@ class RayPPOTrainer(object):
                 raise NotImplementedError
         else:
             self.kl_ctrl = core_algos.FixedKLController(kl_coef=0.)
-
+        # 创建训练和验证 dataloader
         self._create_dataloader()
+        # 初始化日志记录器
         self._init_logger()
     
     def _init_logger(self):
         from verl.utils.tracking import Tracking
-        self.logger = Tracking(project_name=self.config.trainer.project_name,
-                          experiment_name=self.config.trainer.experiment_name,
+        self.logger = Tracking(project_name=self.config.trainer.project_name, # 项目名
+                          experiment_name=self.config.trainer.experiment_name, # 实验名
                           default_backend=self.config.trainer.logger,
                           config=OmegaConf.to_container(self.config, resolve=True))
 
