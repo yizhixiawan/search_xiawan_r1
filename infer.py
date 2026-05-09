@@ -27,7 +27,7 @@ If you find no further external knowledge needed, you can directly provide the a
 tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 model = transformers.AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
 
-# Define the custom stopping criterion
+# Define the custom stopping criterion 寻找停止token_seq
 class StopOnSequence(transformers.StoppingCriteria):
     def __init__(self, target_sequences, tokenizer):
         # Encode the string so we have the exact token-IDs pattern

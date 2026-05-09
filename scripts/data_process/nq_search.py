@@ -50,7 +50,7 @@ import argparse
       }
   }
 """
-
+# 对prompt进行预处理
 def make_prefix(dp, template_type):
     # dp 是一条数据样本，先取出问题
     question = dp['question']
@@ -82,6 +82,12 @@ if __name__ == '__main__':
 
     train_dataset = dataset['train']
     test_dataset = dataset['test']
+    
+    """
+      1. make_map_fn('train') 返回一个 process_fn
+      2. train_dataset.map(...) 会对训练集每一条样本调用这个 process_fn
+      3. 每条原始样本会被转换成训练需要的格式
+    """
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):

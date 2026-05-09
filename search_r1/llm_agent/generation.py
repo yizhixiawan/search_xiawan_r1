@@ -13,7 +13,7 @@ import requests
 @dataclass
 class GenerationConfig:
     max_turns: int
-    max_start_length: int
+    max_start_length: int # 最终训练样本里，原始 prompt 最多保留多少个 token
     max_prompt_length: int 
     max_response_length: int
     max_obs_length: int
@@ -34,14 +34,14 @@ class LLMGenerationManager:
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
-
+        # tensor 工具类，专门处理 padding、attention mask、position ids、拼接、截断
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=tokenizer.pad_token_id,
             max_prompt_length=config.max_prompt_length,
             max_obs_length=config.max_obs_length,
             max_start_length=config.max_start_length
         ))
-
+    # 对responses分词
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
         return self.tokenizer(
@@ -50,14 +50,15 @@ class LLMGenerationManager:
             return_tensors='pt', 
             padding="longest"
         )['input_ids']
-
+    # 如果出现 </search> 或 </answer>，截断到标签结束
     def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
         """Process responses to stop at search operation or answer operation."""
+        # 把 token ids 转成字符串。
         responses_str = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
         )
-
+        # 模型一旦生成了完整的 </search> 或 </answer>，就截断到这个标签为止
         responses_str = [resp.split('</search>')[0] + '</search>'
                  if '</search>' in resp 
                  else resp.split('</answer>')[0] + '</answer>'
@@ -73,7 +74,7 @@ class LLMGenerationManager:
             print("RESPONSES:", responses_str)
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
-
+    # 把搜索结果/错误提示等 observation 转成 token，并限制长度
     def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
         """Process next observations from environment."""
         
@@ -89,11 +90,11 @@ class LLMGenerationManager:
             next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
 
         return next_obs_ids
-
+    # 多轮搜索的关键函数。它更新“下一轮要喂给模型的输入”
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:
         """Update rolling state with new responses and observations."""
-        # Concatenate and handle padding        
+        # Concatenate and handle padding 旧上下文 + 当前模型输出 + 搜索返回信息/错误提示   
         new_input_ids = self.tensor_fn.concatenate_with_padding([
             rollings.batch['input_ids'],
             cur_responses,
@@ -109,6 +110,7 @@ class LLMGenerationManager:
         max_len = min(self.config.max_prompt_length, effective_len)
 
         new_rollings = DataProto.from_dict({
+            # rolling context 最多不能超过 max_prompt_length。如果太长，就从左边截掉旧内容，保留最新上下文。
             'input_ids': new_input_ids[:, -max_len:],
             'position_ids': new_position_ids[:, -max_len:],
             'attention_mask': new_attention_mask[:, -max_len:]
@@ -116,7 +118,7 @@ class LLMGenerationManager:
         new_rollings.meta_info.update(rollings.meta_info)
         
         return new_rollings
-
+    # 构造数据用于最终训练输出和 loss mask，即把pad和检索内容除去
     def _info_masked_concatenate_with_padding(self, 
                 prompt: torch.Tensor, 
                 prompt_with_mask: torch.Tensor, 
@@ -128,25 +130,27 @@ class LLMGenerationManager:
         pad_id = self.tokenizer.pad_token_id
         tensors = [prompt, response]
         tensors_with_mask = [prompt_with_mask, response]
-        if info is not None:
-            tensors.append(info)
+        if info is not None: # info 通常是搜索返回的结果
+            tensors.append(info) # tensors = [prompt, response, info]
+            # 创建一个和 info 形状完全一样的 tensor，但里面全是 pad_id
             info_mask = torch.full(info.size(), pad_id, dtype=info.dtype, device=info.device) # information mask
             tensors_with_mask.append(info_mask)
         
         concatenated = torch.cat(tensors, dim=1)
         concatenated_with_info = torch.cat(tensors_with_mask, dim=1)
+        # 非 pad token 是 True，pad token 是 False。
         mask = concatenated != pad_id if pad_to_left else concatenated == pad_id
         sorted_indices = mask.to(torch.int64).argsort(dim=1, stable=True)
         padded_tensor = concatenated.gather(1, sorted_indices)
         padded_tensor_with_info = concatenated_with_info.gather(1, sorted_indices)
 
         return padded_tensor, padded_tensor_with_info
-
-    def _update_right_side(self, right_side: Dict, 
-                          cur_responses: torch.Tensor,
-                          next_obs_ids: torch.Tensor = None) -> Dict:
+    # 更新最终输出里 prompt 右边的 response 轨迹。
+    def _update_right_side(self, right_side: Dict,  # 累计结果
+                          cur_responses: torch.Tensor, # 当前结果
+                          next_obs_ids: torch.Tensor = None) -> Dict: # 当轮检索结果
         """Update right side state."""
-        if next_obs_ids != None:
+        if next_obs_ids != None: # 判断这一轮有没有 observation/search information 要拼进去
             responses, responses_with_info_mask = self._info_masked_concatenate_with_padding(
                     right_side['responses'],
                     right_side['responses_with_info_mask'],
@@ -163,9 +167,9 @@ class LLMGenerationManager:
                 )
         effective_len = self.tensor_fn.create_attention_mask(responses).sum(dim=1).max()
         max_len = min(self.config.max_prompt_length, effective_len)
-        
+        # 得到新的右侧内容
         return {'responses': responses[:, :max_len], 'responses_with_info_mask': responses_with_info_mask[:, :max_len]}
-
+    # 当 active batch size 不能被 GPU 数整除时，复制第一条样本补齐，生成后再裁掉补齐样本
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """
             Wrapper for generation that handles multi-GPU padding requirements.
@@ -174,7 +178,7 @@ class LLMGenerationManager:
             then remove padding from output
         """
         num_gpus = self.config.num_gpus
-        if num_gpus <= 1:
+        if num_gpus <= 1: # 如果只有 1 张 GPU，或者配置里没有多 GPU，就直接调用模型生成
             return self.actor_rollout_wg.generate_sequences(active_batch)
             
         batch_size = active_batch.batch['input_ids'].shape[0]
@@ -185,14 +189,14 @@ class LLMGenerationManager:
         if remainder == 0:
             return self.actor_rollout_wg.generate_sequences(active_batch)
         
-        # Add padding sequences
+        # Add padding sequences 如果不够的话补到够整除
         padding_size = num_gpus - remainder
         padded_batch = {}
-        
+        # 遍历 batch 里的每个字段。例如：k = "input_ids"，v = tensor shape [batch_size, seq_len]
         for k, v in active_batch.batch.items():
             # Use first sequence as padding template
-            pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))
-            padded_batch[k] = torch.cat([v, pad_sequence], dim=0)
+            pad_sequence = v[0:1].repeat(padding_size, *[1] * (len(v.shape) - 1))# ？？？
+            padded_batch[k] = torch.cat([v, pad_sequence], dim=0) # 原始 batch 和补出来的样本沿 batch 维拼接
 
         padded_active_batch = DataProto.from_dict(padded_batch)
         for key in padded_active_batch.batch.keys():
@@ -201,10 +205,10 @@ class LLMGenerationManager:
         # Generate with padded batch
         padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
 
-        # Remove padding from output
+        # Remove padding from output 把补出来的样本从输出里删掉
         trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
         
-        # Handle meta_info if present
+        # Handle meta_info if present  meta_info 可能包含一些生成过程统计，比如 log prob、长度、采样信息等
         if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
             trimmed_meta = {}
             for k, v in padded_output.meta_info.items():
@@ -223,12 +227,12 @@ class LLMGenerationManager:
         original_left_side = {'input_ids': initial_input_ids[:, -self.config.max_start_length:]}
         original_right_side = {'responses': initial_input_ids[:, []], 'responses_with_info_mask': initial_input_ids[:, []]}
         
-        active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool)
-        turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
-        valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
-        valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
-        active_num_list = [active_mask.sum().item()]
-        rollings = gen_batch
+        active_mask = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.bool) # 表示哪些样本还在继续生成 [batch_size]
+        turns_stats = torch.ones(gen_batch.batch['input_ids'].shape[0], dtype=torch.int) # 统计每条样本用了多少轮
+        valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int) # 统计每条样本生成了多少次合法动作
+        valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int) # 统计每条样本执行了多少次合法搜索
+        active_num_list = [active_mask.sum().item()] # 记录每一轮还有多少 active 样本
+        rollings = gen_batch # 表示当前轮要送进模型的上下文
 
         # Main generation loop
         for step in range(self.config.max_turns):
@@ -239,24 +243,26 @@ class LLMGenerationManager:
                 keys=['input_ids', 'attention_mask', 'position_ids']
             )
             
-            # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
+            # 分布式存储
             rollings_active = DataProto.from_dict({
-                k: v[active_mask] for k, v in rollings.batch.items()
+                k: v[active_mask] for k, v in rollings.batch.items() # v[active_mask]:取还没结束的样本
             })            
-            gen_output = self._generate_with_gpu_padding(rollings_active)
-
+            gen_output = self._generate_with_gpu_padding(rollings_active) # 第一轮生成
+            # 维护元数据
             meta_info = gen_output.meta_info            
             responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
+            # 刚才只对 active 样本生成了,这一步把它 pad 回原始 batch size
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # Execute in environment and process observations
             next_obs, dones, valid_action, is_search = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
-            
+            # 根据 dones 生成新的 active mask
             curr_active_mask = torch.tensor([not done for done in dones], dtype=torch.bool)
             active_mask = active_mask * curr_active_mask
             active_num_list.append(active_mask.sum().item())
+            # 仍然没结束的样本轮数加 1
             turns_stats[curr_active_mask] += 1
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
@@ -264,18 +270,18 @@ class LLMGenerationManager:
             next_obs_ids = self._process_next_obs(next_obs)
             
             # Update states
-            rollings = self._update_rolling_state(
+            rollings = self._update_rolling_state( # 给下一轮模型看
                 rollings,
                 responses_ids,
                 next_obs_ids
             )
-            original_right_side = self._update_right_side(
+            original_right_side = self._update_right_side( # 给最终 PPO 训练输出用
                 original_right_side,
                 responses_ids,
                 next_obs_ids
             )
             
-        # final LLM rollout
+        # final LLM rollout 前面的循环最多跑 max_turns 次，如果有些样本一直在 search 或 invalid，没有输出最终 answer，就给它最后一次机会生成答案
         if active_mask.sum():
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
@@ -285,7 +291,7 @@ class LLMGenerationManager:
             # gen_output = self.actor_rollout_wg.generate_sequences(rollings)
             rollings_active = DataProto.from_dict({
                 k: v[active_mask] for k, v in rollings.batch.items()
-            })            
+            })
             gen_output = self._generate_with_gpu_padding(rollings_active)
 
             meta_info = gen_output.meta_info            
