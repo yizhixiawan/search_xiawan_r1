@@ -331,6 +331,11 @@ class RayPPOTrainer(object):
                  ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
                  reward_fn=None,
                  val_reward_fn=None):
+        """初始化 RayPPOTrainer 的基础状态。
+
+        保存配置、tokenizer、奖励函数和 worker/resource 映射；根据配置创建 KL 控制器；
+        然后创建 dataloader 和 logger。这里还不会启动 Ray worker，也不会加载模型。
+        """
 
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
@@ -372,6 +377,11 @@ class RayPPOTrainer(object):
         self._init_logger()
     
     def _init_logger(self):
+        """初始化日志记录器。
+
+        根据 trainer 配置创建 Tracking 对象，后续训练循环用 `self.logger.log(...)`
+        记录 reward、loss、耗时、验证分数等 metrics。
+        """
         from verl.utils.tracking import Tracking
         self.logger = Tracking(project_name=self.config.trainer.project_name, # 项目名
                           experiment_name=self.config.trainer.experiment_name, # 实验名
@@ -379,6 +389,12 @@ class RayPPOTrainer(object):
                           config=OmegaConf.to_container(self.config, resolve=True))
 
     def _create_dataloader(self):
+        """创建训练集和验证集 DataLoader。
+
+        从 parquet 文件构造 RLHFDataset，完成 prompt 的 chat template/tokenize，
+        并保留 data_source、reward_model、extra_info 等非 tensor 信息。这里还会
+        计算总训练步数，并写回 actor/critic optimizer 配置。
+        """
         from torch.utils.data import DataLoader
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
@@ -436,16 +452,18 @@ class RayPPOTrainer(object):
 
         self.total_training_steps = total_training_steps
         print(f'Total training steps: {self.total_training_steps}')
-
+        # 只允许修改键值，不允许增加键，防止打错而增加键
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
-
+    # 用当前 actor 模型在验证集上生成答案，然后用 val_reward_fn 算分，最后按 data_source 汇总验证分数
     def _validate(self):
-        """
-        The training loop of PPO with global metric computation.
-        Accumulates metrics across all batches before computing final statistics.
+        """在验证集上生成答案并计算验证指标。
+
+        `do_search=False` 时直接调用 rollout worker 普通生成；`do_search=True`
+        时调用 Search-R1 的 LLMGenerationManager 执行多轮检索生成。函数只做评估，
+        不计算梯度、不更新 actor/critic，最后按 data_source 返回 `val/test_score/*`。
         """
         import torch
         reward_tensor_lst = []
@@ -472,8 +490,8 @@ class RayPPOTrainer(object):
         )
 
         if not self.config.do_search:
-            for test_data in self.val_dataloader:
-                test_batch = DataProto.from_single_dict(test_data)
+            for test_data in self.val_dataloader: # 遍历每一个batch
+                test_batch = DataProto.from_single_dict(test_data) # 转文件格式
 
                 # we only do validation on rule-based rm
                 if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
@@ -488,13 +506,13 @@ class RayPPOTrainer(object):
                     'validate': True,
                 }
 
-                # pad to be divisible by dp_size
+                # pad to be divisible by dp_size 把 batch padding 到能被 worker 数整除
                 test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-                # unpad
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded) # 生成response
+                # unpad 刚才 padding 出来的假样本去掉
                 test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
                 print('validation generation end')
-
+                # 生成结果合并回原 batch
                 test_batch = test_batch.union(test_output_gen_batch)
 
                 # evaluate using reward_function
@@ -505,7 +523,7 @@ class RayPPOTrainer(object):
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
         else:
             for batch_dict in self.val_dataloader:
-                timing_raw = {}
+                timing_raw = {} # timing_raw = {}
                 test_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 # test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
                 
@@ -537,10 +555,10 @@ class RayPPOTrainer(object):
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
-
+        # 把所有 batch 的 reward 拼成一个大 tensor
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        data_sources = np.concatenate(data_source_lst, axis=0)
+        data_sources = np.concatenate(data_source_lst, axis=0) # 所有 batch 的 data_source 拼成一个 NumPy 数组
         # evaluate test_score based on data source
         data_source_reward = {}
         for i in range(reward_tensor.shape[0]):
@@ -549,7 +567,7 @@ class RayPPOTrainer(object):
                 data_source_reward[data_source] = []
             data_source_reward[data_source].append(reward_tensor[i].item())
 
-        metric_dict = {}
+        metric_dict = {} # 计算该数据源的平均验证分数
         for data_source, rewards in data_source_reward.items():
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
@@ -557,7 +575,12 @@ class RayPPOTrainer(object):
 
 
     def init_workers(self):
-        """Init resource pool and worker group"""
+        """初始化 Ray 资源池、worker group 和各角色模型。
+
+        根据 Role 创建 actor_rollout、critic、ref、reward model 等 worker。
+        PPO/GAE 会创建 critic；GRPO 不创建 critic。actor_rollout 最后初始化，
+        让 vLLM 可以根据剩余显存估算 KV cache。
+        """
         self.resource_pool_manager.create_resource_pool()
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
@@ -574,9 +597,9 @@ class RayPPOTrainer(object):
 
         # create critic
         if self.config.algorithm.adv_estimator == 'gae':
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
-            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
-            self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic) # 构造资源池
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)  # 创建worker
+            self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls # 写入资源池表
             self.use_critic = True
             
         elif self.config.algorithm.adv_estimator == 'grpo':
@@ -630,6 +653,11 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg.init_model()
 
     def _save_checkpoint(self):
+        """保存 actor checkpoint；如果使用 critic，也保存 critic checkpoint。
+
+        本地路径由 `trainer.default_local_dir` 决定；如果配置了
+        `trainer.default_hdfs_dir`，worker 的 save_checkpoint 会同时处理远端路径。
+        """
         actor_local_path = os.path.join(self.config.trainer.default_local_dir, 'actor',
                                         f'global_step_{self.global_steps}')
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
@@ -644,7 +672,11 @@ class RayPPOTrainer(object):
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path)
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
-        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        """按样本 token 数重排 batch，使各数据并行 rank 的负载更均衡。
+
+        它根据 attention_mask 统计每条样本的总 token 数，再把样本重排成多个分区，
+        让每个 actor rollout worker 分到的总 token 数尽量接近，并把均衡统计写入 metrics。
+        """
         attention_mask = batch.batch['attention_mask']
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = attention_mask.view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
@@ -661,10 +693,12 @@ class RayPPOTrainer(object):
         metrics.update(global_balance_stats)
 
     def fit(self):
-        """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
+        """执行 PPO/GRPO 训练主循环。
+
+        主流程：可选训练前验证，遍历 train_dataloader，生成 rollout；Search-R1
+        模式下会执行多轮检索生成；随后计算 ref logprob、value、reward、advantage，
+        更新 critic 和 actor，定期验证、保存 checkpoint，并记录 metrics。driver 主要
+        通过 Ray RPC 调用 worker group，轻量的 reward/advantage 汇总在 driver 上完成。
         """
 
         logger = self.logger
@@ -861,7 +895,12 @@ class RayPPOTrainer(object):
                     return
     
     def _create_loss_mask(self, batch, metrics):
-        """Create loss mask for state tokens."""
+        """为 Search-R1 轨迹创建 actor loss mask。
+
+        多轮检索时，response 里会包含检索返回的 observation/state token；这些 token
+        不是模型需要学习生成的内容。这里用 `info_mask` 构造 `loss_mask`，让 actor
+        update 只在应学习的 response token 上计算 loss，并记录 mask 覆盖率。
+        """
         response_length = batch.batch['responses'].shape[-1]
         response_mask = batch.batch['attention_mask'][:, -response_length:]
         
